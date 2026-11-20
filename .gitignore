@@ -23,3 +23,13 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# 本地验收产物（PDF / 渲染对照 / 截图）
+.probe/
+.verify/
+.stash/
+test-results/
+playwright-report/
+
+# 沙箱里 Chromium 缺失的运行时库（体积大，按需用 .vendor/getlibs.sh 重新解包）
+.vendor/

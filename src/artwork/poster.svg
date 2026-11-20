@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="620" viewBox="0 0 440 620">
+  <title>叶与光 — 转换能力验收海报</title>
+  <style>
+    .ink { fill: #22382f; }
+    .leaf-a { fill: #4b7a5a; }
+    .leaf-b { fill: #8fae63; }
+    .vine { fill: none; stroke: #22382f; stroke-width: 0.9; stroke-linecap: round; stroke-linejoin: miter; stroke-miterlimit: 10; }
+    .blend-zone { mix-blend-mode: multiply; }
+  </style>
+
+  <defs>
+    <clipPath id="panel-clip">
+      <rect x="36" y="64" width="368" height="440" rx="26"/>
+    </clipPath>
+    <clipPath id="disc-clip">
+      <circle cx="216" cy="268" r="138"/>
+    </clipPath>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <rect data-obj="bg" data-label="底色" x="0" y="0" width="440" height="620" fill="#f2ece0"/>
+
+  <g data-obj="panel" data-label="窗景（两层裁剪）" clip-path="url(#panel-clip)">
+    <rect data-obj="panel-fill" data-label="窗底" x="36" y="64" width="368" height="440" fill="#e7dfcf"/>
+    <g data-obj="panel-bands" data-label="斜带" transform="rotate(-12 220 284)">
+      <rect data-obj="band-warm" data-label="暖带" x="-40" y="168" width="520" height="56" fill="#cf5f3f"/>
+      <rect data-obj="band-cool" data-label="冷带" x="-40" y="330" width="520" height="24" fill="#3f6f73"/>
+    </g>
+    <g data-obj="disc" data-label="圆窗（内层裁剪）" clip-path="url(#disc-clip)">
+      <circle data-obj="disc-fill" data-label="圆底" cx="216" cy="268" r="138" fill="#3f6f73"/>
+      <rect data-obj="disc-band" data-label="圆内横带" x="60" y="300" width="330" height="46" fill="#e0a84a"/>
+    </g>
+    <path class="vine" data-obj="vine" data-label="细藤（细线接合）"
+          d="M70 470 C120 420 150 452 196 416 L208 398 L222 421 L240 392 C282 352 330 372 372 326"/>
+    <path class="vine" data-obj="vine-spur" data-label="细藤支刺"
+          d="M208 398 L198 372 L214 386"/>
+  </g>
+
+  <g data-obj="leaf-pair" data-label="叶片对（组透明度 0.72）" opacity="0.72">
+    <path class="leaf-a" data-obj="leaf-a" data-label="叶 A（偶奇孔）" fill-rule="evenodd"
+          d="M140 344 C160 300 212 282 254 298 C216 332 172 350 140 344 Z
+             M182 322 C192 310 208 305 218 307 C207 318 194 325 182 322 Z"/>
+    <path class="leaf-b" data-obj="leaf-b" data-label="叶 B（偶奇孔）" fill-rule="evenodd"
+          d="M204 366 C226 330 276 318 316 330 C282 360 238 376 204 366 Z
+             M246 344 C255 335 268 331 277 333 C268 342 257 348 246 344 Z"/>
+  </g>
+
+  <rect class="blend-zone" data-obj="blend-zone" data-label="叠加块（依赖背景的混合）"
+        x="360" y="250" width="72" height="72" fill="#1d8f7a"/>
+
+  <circle data-obj="glow" data-label="柔光（局部模糊）" cx="322" cy="512" r="24" fill="#ff5f8a" filter="url(#glow)"/>
+
+  <g data-obj="marks" data-label="定位标记" fill="none" stroke="#8d8574" stroke-width="1">
+    <path d="M14 22 H34 M24 12 V32"/>
+    <path d="M406 22 H426 M416 12 V32"/>
+    <path d="M14 588 H34 M24 578 V598"/>
+    <path d="M406 588 H426 M416 578 V598"/>
+  </g>
+</svg>
