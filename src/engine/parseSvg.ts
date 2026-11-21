@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { DOMParser, type Document, type Element } from 'linkedom';
 import { parseColor, type Rgba } from './color.js';
-import { applyPoint, IDENTITY, multiply, type Matrix } from './matrix.js';
+import { IDENTITY, multiply, type Matrix } from './matrix.js';
 import {
   ellipsePath,
   expandBBox,
@@ -24,6 +24,8 @@ import type {
   FilterInfo,
   LinearGradientPaint,
   Paint,
+  PatternDef,
+  PatternShape,
   Scene,
   SceneGroup,
   SceneImage,
@@ -164,6 +166,8 @@ function parseDecls(text: string): Record<string, string> {
 export interface ParseOptions {
   width?: number;
   height?: number;
+  /** 编辑器覆盖层：按对象 id 给图案原点加偏移，不改动公共定义。 */
+  patternOverrides?: Record<string, { dx: number; dy: number }>;
 }
 
 export function parseSvg(source: string, options: ParseOptions = {}): Scene {
@@ -190,6 +194,7 @@ export function parseSvg(source: string, options: ParseOptions = {}): Scene {
 
   const parser = new SceneParser(doc, sheet, warnings);
   parser.scanGradients(root);
+  parser.scanPatterns(root);
   const viewTransform: Matrix = [
     width / (viewBox.w || vbW),
     0,
@@ -230,6 +235,15 @@ export function parseSvg(source: string, options: ParseOptions = {}): Scene {
   const byId = new Map<string, SceneNode>();
   for (const n of parser.allNodes) byId.set(n.id, n);
   byId.set('root', rootGroup);
+  if (options.patternOverrides) {
+    for (const n of parser.allNodes) {
+      if (n.kind !== 'path') continue;
+      const o = options.patternOverrides[n.id];
+      if (o && n.fill?.type === 'pattern' && (o.dx !== 0 || o.dy !== 0)) {
+        n.patternOriginOverride = { dx: o.dx, dy: o.dy };
+      }
+    }
+  }
   return {
     width,
     height,
@@ -238,6 +252,7 @@ export function parseSvg(source: string, options: ParseOptions = {}): Scene {
     nodes: parser.allNodes,
     byId,
     gradients: parser.gradients,
+    patterns: parser.patterns,
     sourceSvg: source,
     warnings,
     paintOrder: parser.paintOrder,
@@ -283,6 +298,7 @@ class SceneParser {
   readonly allNodes: SceneNode[] = [];
   readonly paintOrder: SceneNode[] = [];
   readonly gradients = new Map<string, LinearGradientPaint>();
+  readonly patterns = new Map<string, PatternDef>();
   private counter = 0;
   private clipCache = new Map<string, ClipRef>();
 
@@ -300,6 +316,67 @@ class SceneParser {
     }
   }
 
+  scanPatterns(root: Element): void {
+    for (const el of Array.from(root.querySelectorAll('pattern'))) {
+      const id = el.getAttribute('id');
+      if (!id) continue;
+      const num = (name: string, fallback: number): number => {
+        const raw = el.getAttribute(name);
+        if (raw == null || raw.trim() === '') return fallback;
+        const m = raw.trim().match(/^(-?[\d.]+(?:e[-+]?\d+)?)(%)?$/);
+        if (!m) return fallback;
+        const n = parseFloat(m[1]);
+        return m[2] ? n / 100 : n;
+      };
+      const units = (el.getAttribute('patternUnits') ?? 'objectBoundingBox').trim();
+      const contentUnits = (el.getAttribute('patternContentUnits') ?? 'userSpaceOnUse').trim();
+      const width = num('width', 0);
+      const height = num('height', 0);
+      const label = el.getAttribute('data-label') || el.getAttribute('aria-label') || id;
+      if (!(width > 0) || !(height > 0)) {
+        this.warnings.push(
+          `图案「${label}」的单元尺寸为 ${width}×${height}：重复单元必须为正宽正高，该图案已按无填充处理`,
+        );
+        continue;
+      }
+      const shapes: PatternShape[] = [];
+      for (const child of Array.from(el.children)) {
+        const tag = (child.localName ?? child.tagName).toLowerCase();
+        if (!SHAPE_TAGS.has(tag)) {
+          this.warnings.push(`图案「${label}」内的 <${tag}> 暂不支持，已跳过`);
+          continue;
+        }
+        const d = normalizePath(this.shapeGeometry(child, tag));
+        if (!d) continue;
+        const style = this.computeStyle(child, { ...ROOT_STYLE });
+        const fill = this.resolvePaint(style.fill, style.fillOpacity, child, `${label} 单元`, true);
+        const opacity = parseOpacity(this.computedValue(child, 'opacity'), 1);
+        shapes.push({
+          d,
+          fill,
+          fillRule: style.fillRule,
+          opacity,
+        });
+      }
+      if (shapes.length === 0) {
+        this.warnings.push(`图案「${label}」没有可用的单元内容，已按无填充处理`);
+        continue;
+      }
+      this.patterns.set(id, {
+        id,
+        label,
+        x: num('x', 0),
+        y: num('y', 0),
+        width,
+        height,
+        patternUnits: units === 'userSpaceOnUse' ? 'userSpaceOnUse' : 'objectBoundingBox',
+        contentUnits: contentUnits === 'objectBoundingBox' ? 'objectBoundingBox' : 'userSpaceOnUse',
+        patternTransform: parseTransform(el.getAttribute('patternTransform')),
+        shapes,
+      });
+    }
+  }
+
   visit(
     el: Element,
     inherited: Style,
@@ -307,6 +384,7 @@ class SceneParser {
     parentId: string | null,
     depth: number,
     inheritedClip = false,
+    as?: { id: string; label: string; resourceId: string },
   ): SceneNode | null {
     const tag = (el.localName ?? el.tagName).toLowerCase();
     if (SKIP_TAGS.has(tag)) return null;
@@ -314,10 +392,11 @@ class SceneParser {
       this.warnings.push(`文本 <${el.getAttribute('id') ?? tag}> 未转换为轮廓，已跳过`);
       return null;
     }
-    if (tag === 'use' || tag === 'foreignObject' || tag === 'symbol') {
+    if (tag === 'foreignObject' || tag === 'symbol') {
       this.warnings.push(`<${tag}> 依赖外部/符号引用，未导出`);
       return null;
     }
+    if (tag === 'use') return this.visitUse(el, inherited, parentAbs, parentId, depth, inheritedClip);
 
     const style = this.computeStyle(el, inherited);
     const ownTransform = parseTransform(this.declValue(el, 'transform'));
@@ -328,8 +407,10 @@ class SceneParser {
     const filter = this.resolveFilter(this.computedValue(el, 'filter'), abs);
     const maskAttr = this.computedValue(el, 'mask');
     const mask = !!maskAttr && maskAttr !== 'none';
-    const label = el.getAttribute('data-label') || el.getAttribute('aria-label') || el.getAttribute('id') || `${tag} ${this.counter + 1}`;
-    const id = el.getAttribute('data-obj') || el.getAttribute('id') || `${tag}-${++this.counter}`;
+    const label =
+      as?.label ??
+      (el.getAttribute('data-label') || el.getAttribute('aria-label') || el.getAttribute('id') || `${tag} ${this.counter + 1}`);
+    const id = as?.id ?? (el.getAttribute('data-obj') || el.getAttribute('id') || `${tag}-${++this.counter}`);
 
     const commonFeatures: Feature[] = [];
     if (filter) commonFeatures.push(filter.kind === 'blur' ? 'blur' : 'filter-other');
@@ -423,7 +504,8 @@ class SceneParser {
     const d = normalizePath(this.shapeGeometry(el, tag));
     if (!d) return null;
     const localBox = pathBBox(d);
-    const fill = this.resolvePaint(style.fill, style.fillOpacity, el, label);
+    let fill = this.resolvePaint(style.fill, style.fillOpacity, el, label);
+    fill = this.guardZeroBBox(fill, localBox, label);
     const stroke = parseColor(style.stroke, style.strokeOpacity);
     const scale = Math.max(Math.hypot(abs[0], abs[1]), Math.hypot(abs[2], abs[3])) || 1;
     const strokeWorldWidth = style.strokeWidth * scale;
@@ -439,6 +521,8 @@ class SceneParser {
       features.push('linear-gradient');
       if (fill.stops.some((s) => s.color.a < 0.999)) features.push('gradient-alpha');
     }
+    if (fill?.type === 'pattern') features.push('pattern');
+    if (as?.resourceId) features.push('use-instance');
     const node: ScenePath = {
       kind: 'path',
       id,
@@ -467,10 +551,76 @@ class SceneParser {
       dash: style.dash,
       filter,
       mask,
+      resourceId: as?.resourceId ?? null,
+      patternOriginOverride: null,
     };
     this.register(node);
     this.paintOrder.push(node);
     return node;
+  }
+
+  /**
+   * <use> 实例化：几何保持 def 局部坐标，实例变换（含镜像/缩放）全部留在
+   * absTransform，导出时写进内容流的 cm，共享几何进 Form XObject。
+   */
+  private visitUse(
+    el: Element,
+    inherited: Style,
+    parentAbs: Matrix,
+    parentId: string | null,
+    depth: number,
+    inheritedClip: boolean,
+  ): SceneNode | null {
+    const href = el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+    const label =
+      el.getAttribute('data-label') || el.getAttribute('aria-label') || el.getAttribute('id') || `use ${this.counter + 1}`;
+    if (!href.startsWith('#')) {
+      this.warnings.push(`<use>「${label}」引用外部资源（${href.slice(0, 40)}），未导出`);
+      return null;
+    }
+    const defEl = this.doc.querySelector(`[id="${href.slice(1)}"]`);
+    if (!defEl) {
+      this.warnings.push(`<use>「${label}」找不到引用目标 ${href}`);
+      return null;
+    }
+    const defTag = (defEl.localName ?? defEl.tagName).toLowerCase();
+    if (!SHAPE_TAGS.has(defTag)) {
+      this.warnings.push(`<use>「${label}」引用 <${defTag}>：目前只支持单条形状定义，已跳过`);
+      return null;
+    }
+    const style = this.computeStyle(el, inherited);
+    const ownTransform = parseTransform(this.declValue(el, 'transform'));
+    const useX = readLength(el.getAttribute('x'), 0);
+    const useY = readLength(el.getAttribute('y'), 0);
+    const abs = multiply(multiply(parentAbs, ownTransform), [1, 0, 0, 1, useX, useY]);
+    const id = el.getAttribute('data-obj') || el.getAttribute('id') || `use-${++this.counter}`;
+    // def 上未声明的填充/描边按 <use> 的计算样式继承（CSS 级联进影子树）
+    return this.visit(defEl, style, abs, parentId, depth, inheritedClip, {
+      id,
+      label,
+      resourceId: href.slice(1),
+    });
+  }
+
+  /**
+   * objectBoundingBox 资源在零宽/零高包围盒上没有定义（SVG 规范：不渲染）。
+   * 给出可读诊断并把填充降级为 none，避免产出 NaN 矩阵。
+   */
+  private guardZeroBBox(fill: Paint | null, box: BBox, label: string): Paint | null {
+    if (!fill) return fill;
+    const units =
+      fill.type === 'linear' ? fill.gradientUnits : fill.type === 'pattern' ? this.patterns.get(fill.id)?.patternUnits : null;
+    if (units !== 'objectBoundingBox') return fill;
+    const zeroW = !(box.w > 1e-9);
+    const zeroH = !(box.h > 1e-9);
+    if (!zeroW && !zeroH) return fill;
+    const dims = [zeroW ? `宽 ${round2(box.w)}` : null, zeroH ? `高 ${round2(box.h)}` : null].filter(Boolean).join('、');
+    const kind = fill.type === 'linear' ? '渐变' : '图案';
+    this.warnings.push(
+      `「${label}」的几何包围盒${dims}：objectBoundingBox ${kind}在零尺寸轴上无法定义映射，` +
+        `按 SVG 规范该填充不渲染，已改为不填充；如需可见效果请改用 userSpaceOnUse 或描边`,
+    );
+    return null;
   }
 
   private register(node: SceneNode): void {
@@ -571,12 +721,23 @@ class SceneParser {
     return '';
   }
 
-  private resolvePaint(value: string, opacity: number, el: Element, label: string): Paint | null {
+  private resolvePaint(value: string, opacity: number, el: Element, label: string, insidePattern = false): Paint | null {
     const trimmed = value.trim();
     const urlMatch = trimmed.match(/^url\(\s*["']?#([^"')]+)["']?\s*\)(?:\s+(.+))?$/);
     if (urlMatch) {
       const gradient = this.gradients.get(urlMatch[1]);
       if (gradient) return withOpacity(gradient, opacity);
+      const pattern = this.patterns.get(urlMatch[1]);
+      if (pattern) {
+        if (insidePattern) {
+          this.warnings.push(`图案「${label}」内嵌套引用另一个图案 #${urlMatch[1]}，暂不支持，已按无填充处理`);
+          return null;
+        }
+        if (opacity < 0.999) {
+          this.warnings.push(`「${label}」图案填充的 fill-opacity 暂不支持，按 1 处理`);
+        }
+        return { type: 'pattern', id: pattern.id };
+      }
       const fallback = urlMatch[2] ? parseColor(urlMatch[2], opacity) : null;
       if (fallback) return { type: 'solid', color: fallback };
       this.warnings.push(`无法解析填充引用 #${urlMatch[1]}（${label}）`);
@@ -701,27 +862,8 @@ function withOpacity(gradient: LinearGradientPaint, opacity: number): LinearGrad
   return { ...gradient, stops: gradient.stops.map((s) => ({ ...s, color: { ...s.color, a: s.color.a * opacity } })) };
 }
 
-export function gradientWorldPoints(
-  paint: LinearGradientPaint,
-  bbox: BBox,
-  abs: Matrix,
-): { x1: number; y1: number; x2: number; y2: number } {
-  let basis: Matrix;
-  if (paint.gradientUnits === 'userSpaceOnUse') {
-    basis = multiply(abs, paint.gradientTransform);
-  } else {
-    basis = multiply(
-      multiply(abs, [bbox.w, 0, 0, bbox.h, bbox.x, bbox.y]),
-      paint.gradientTransform,
-    );
-  }
-  const [x1, y1] = applyPoint(basis, paint.x1, paint.y1);
-  const [x2, y2] = applyPoint(basis, paint.x2, paint.y2);
-  return { x1, y1, x2, y2 };
-}
-
-export function anchorWorldPoint(node: SceneNode, x: number, y: number): [number, number] {
-  return applyPoint(node.absTransform, x, y);
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
 }
 
 export { unionBBox };

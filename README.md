@@ -11,6 +11,10 @@
 海报本身就是一组反例：两片叶子先叠进一个组，透明度加在这个组上；窗景背景穿过两层裁剪边；
 正片叠底块压在圆窗上，必须拿到它下面真实的像素；柔光圆只有模糊这一项超纲。
 
+第二张画板「双实例」针对**跨实例复用的渐变与图案资源表**：两个 `<use>` 实例共享同一条宝石路径，
+一个镜像、一个半尺寸，填充同一平铺图案；画布原点在负坐标区。导出的 PDF 里 Shading、
+图案单元 Form、共享路径 Form 全文档唯一，实例差异只留在使用点的 `cm` 里。
+
 ## 快速开始
 
 ```bash
@@ -18,34 +22,65 @@ npm install
 npm run dev          # http://127.0.0.1:5173
 ```
 
-- 顶部切换 **目标能力档案**；**严格模式** 打开后会明确拒绝并有横幅说明，不产出任何降级 PDF。
+- 顶部切换 **画板**（反例海报 / 双实例）与 **目标能力档案**；**严格模式** 打开后会明确拒绝并有横幅说明，不产出任何降级 PDF。
 - 左栏是源 SVG 与对象清单；中栏是转换计划（统计、逐对象决策、局部栅格块与参与边界）；
   右栏是回读后的 PDF，点击任意位置可列出该处命中的对象类型、决策、裁剪与栅格信息。
+- 双实例画板里可以直接 **拖动任一 `<use>` 实例**：平移量写回源 SVG 并自动重转。
+- **共享资源表** 面板列出 Shading / 渐变图案 / 平铺图案 / Form 四级资源与每个使用点的
+  重复单元起点、周期，并说明哪些变换写进资源、哪些留在使用点；
+  **编辑图案原点** 可选择「更改公共定义」（所有实例一起移动）或「仅覆盖某一实例」
+  （只为该实例派生一份新平铺字典，共享单元不变）。
 - 底部 **独立渲染对照 · 像素校验** 在孔内、叶片重叠、细线接合、依赖背景的混合、模糊中心
-  与角标处同时取样，逐条给出 Δ 与区域均差。
+  与角标处同时取样，逐条给出 Δ 与区域均差；双实例画板则覆盖色标位置、图案周期、
+  透明交叠与镜像/半尺寸实例的图案相位。
 
 ## 验证
 
 ```bash
 npm run build                              # tsc --noEmit + vite build
-npx playwright test                        # 8 个端到端用例
-npx tsx scripts/verify.ts                  # 命令行全链路验收（默认 PDF 1.7 原生能力）
-npx tsx scripts/verify.ts --profile reader-lite
-npx tsx scripts/verify.ts --profile reader-lite --strict   # 期望以「明确拒绝」结束
+npx playwright test                        # 16 个端到端用例（海报 9 + 双实例 7）
+npx tsx scripts/verify.ts                  # 命令行全链路验收（默认海报 · PDF 1.7 原生能力）
+npx tsx scripts/verify.ts --art duo        # 双实例画板：资源表断言 + 11 个探针
+npx tsx scripts/verify.ts --art duo --override inst-b:12,8   # 单实例图案原点覆盖
+npx tsx scripts/verify.ts --art duo --profile reader-lite    # 受限档案：渐变/图案整体栅格化
+npx tsx scripts/verify.ts --profile reader-lite --strict     # 期望以「明确拒绝」结束
 ```
 
 `scripts/verify.ts` 不经过浏览器：解析 → 场景 IR → 能力计划 → PDF 写入 → PDF.js 渲染，
-把渲染结果与 resvg 独立渲染的源图逐像素比较，并复用界面里的 7 个固定探针。
+把渲染结果与 resvg 独立渲染的源图逐像素比较，并复用界面里的探针。
+双实例画板额外断言资源表：Shading 唯一且色标 3 个、两实例 Do 同一共享路径 Form、
+平铺周期 80×80、半尺寸实例恰好盖满一个单元、覆盖时仅派生一份新字典而单元 Form 仍共享，
+并从导出的 PDF 字节里回读资源引用复核（不经过内存场景图）。
 
-当前结果：像素均差 **0.033**，超过 12 级的像素占 **0.13%**（基本只在抗锯齿边缘），
-7/7 探针通过；两种档案 × 严格开关共 4 种组合行为符合预期。
+当前结果：海报像素均差 **0.033**、7/7 探针通过；双实例（含覆盖与受限档案共 4 种组合）
+像素均差 ≤ **0.27**、11/11 探针通过、资源断言全绿。
+
+## 共享资源表：哪些变换写进资源，哪些留在使用点
+
+- **写进共享资源**：渐变色标与定义空间向量（Shading）、图案单元几何与单元内渐变
+  （Form XObject）、平铺周期 XStep/YStep、共享路径几何（Form XObject）、
+  平铺原点的局部映射（Pattern `/Matrix`，实例间共享同一字典）。
+- **留在使用点**：实例的镜像/缩放/平移（内容流 `cm`，作用于几何与图案定位）、
+  objectBoundingBox→实例包围盒的映射（各使用点专属 Pattern 字典）、
+  单实例图案原点覆盖（仅该实例派生一份新字典）。
+- **关键规则**：PDF 图案的 `/Matrix` 映射到**父内容流的默认坐标系**。页级内联填充的父流是
+  页面内容流，`/Matrix` 写完整链路（页面翻转 · 实例变换 · 局部映射）；共享路径 Form 内填充的
+  父流是该 Form，`Do` 点的 `cm` 已成为其默认坐标系，`/Matrix` 只写局部映射——
+  否则实例变换被应用两次（共享渐变色标被重复变换）。
+- **图案原点语义**：SVG 图案的 `x/y` 只决定重复单元的裁剪窗口，内容格点不随之平移；
+  「移动图案原点」在引擎里是 `tileToLocal` 的平移，物化到 SVG 时等价于把图案内容包一层
+  `translate(dx dy)`。编辑器（资源表面板）与目标文件（usage 表里的单元起点/周期，
+  设计坐标）都能解释重复单元从何处起算。
+- **零宽包围盒**：objectBoundingBox 渐变在零尺寸轴上无法定义映射，按 SVG 规范不渲染；
+  解析器给出可读诊断并改为不填充（描边保留）。
 
 ## 转换计划怎么决策
 
 | 特性 | PDF 1.7 原生能力 | 基础阅读器（受限） |
 | --- | --- | --- |
 | 矢量路径 / 偶奇填充 / 两层裁剪 / 隔离透明组 | 保留矢量 | 保留矢量 |
-| 轴向线性渐变 | 写成 Shading | 局部栅格 |
+| 轴向线性渐变 | 写成 Shading（跨实例共享） | 局部栅格 |
+| 平铺图案 | 共享单元 Form + 使用点矩阵 | 局部栅格 |
 | 正片叠底等混合模式 | PDF `/BM` 原生 | 局部栅格（依赖背景） |
 | 高斯模糊 | 局部栅格（自身效果） | 局部栅格（自身效果） |
 | 严格模式下的任何超纲项 | 拒绝并中止 | 拒绝并中止 |
@@ -62,16 +97,15 @@ npx tsx scripts/verify.ts --profile reader-lite --strict   # 期望以「明确�
 
 ```
 src/engine/       解析 → 场景 IR → 能力计划 → PDF 写入器 → 局部栅格
-src/server/       resvg 渲染辅助
-src/lib/          PDF.js 回读（标记内容 / 路径几何 / 命中测试）与像素采样
-src/components/   源面板、计划面板、PDF 检查器、像素探针
+src/lib/          PDF.js 回读（标记内容 / 路径几何 / 命中测试）、像素采样、同构 SVG 编辑
+src/components/   源面板、计划面板、PDF 检查器、共享资源表、像素探针
 server/           Vite 中间件：/api/poster、/api/convert、/api/source.png
-scripts/verify.ts 命令行验收
+scripts/verify.ts 命令行验收；scripts/getlibs.sh 解包 Chromium 运行时库
 e2e/              Playwright 用例
 ```
 
 PDF 里每个对象都用 `/<id> BMC … EMC` 标记内容包起来，同时附一份
-`inkplate-object-map.json`（EmbeddedFile）记录计划；点击检查读取的是**导出后 PDF** 的
+`inkplate-object-map.json`（EmbeddedFile）记录计划与资源表；点击检查读取的是**导出后 PDF** 的
 `constructPath` 操作符与当前变换矩阵，不依赖内存里的场景图。
 
 ## 环境注意事项（本仓库已处理）
@@ -80,11 +114,14 @@ PDF 里每个对象都用 `/<id> BMC … EMC` 标记内容包起来，同时附�
   安装任意 CJK 字体（本项目用 `wqy-zenhei.ttc` 到 `~/.local/share/fonts/` 后 `fc-cache -f`）即可；
   resvg 需要 `loadSystemFonts`，PDF.js 由浏览器自带字体渲染界面文本。该字体是本机依赖，
   不随仓库分发。
-- **Chromium 依赖**：沙箱缺 `libnspr4` 等库。`.vendor/getlibs.sh` 会从 Debian arm64 仓库解包到
-  `.vendor/chromium-libs`，`playwright.config.ts` 检测到该目录就自动拼进 `LD_LIBRARY_PATH`；
-  在依赖齐全的机器上这步会跳过。`.vendor/` 已忽略，需要时重新运行脚本即可。
+- **Chromium 依赖**：沙箱缺 `libnspr4` 等库且没有 sudo。`scripts/getlibs.sh` 会从 Debian arm64
+  仓库解包到 `.vendor/chromium-libs`，`playwright.config.ts` 检测到该目录就自动拼进
+  `LD_LIBRARY_PATH`；在依赖齐全的机器上这步会跳过。`.vendor/` 已忽略，需要时重新运行脚本即可。
 - **PDF 写入器易错点**：`cm` 必须是六个裸操作数而不是数组；路径操作符要写在参数之后
   （`0 0 m`）；填充前必须显式写 `rg`；只描边的路径不能先 `n` 再 `S`；ExtGState 的资源名
   与流里 `/GS<n> gs` 必须一致。
 - **PDF.js 两种构建的差异**：浏览器构建的 `beginMarkedContent` 参数会多包一层数组，
   `constructPath` 的绘制数据也是 `[opId, [Float32Array], minMax]`，回读代码对两者都做了兼容。
+- **resvg 图案怪癖**：userSpaceOnUse 图案的 `x/y` 在 resvg 里只作平铺偏移、内容总被裁到
+  `[0,w]×[0,h]`（规范应为 `[x,x+w]×[y,y+h]`）。给 resvg 的真源会包一层
+  `translate(-x,-y)` 补偿（`resvgPatternQuirkFix`），引擎写出的 SVG/PDF 不受影响。

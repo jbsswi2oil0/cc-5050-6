@@ -1,6 +1,6 @@
-import type { BBox, LinearGradientPaint, Paint, Scene, SceneGroup, SceneNode } from './types.js';
+import type { BBox, LinearGradientPaint, Paint, PatternDef, Scene, SceneGroup, SceneNode } from './types.js';
 import { formatMatrix } from './matrix.js';
-import { toCss } from './color.js';
+import { toHex } from './color.js';
 
 export interface EffectOptions {
   opacity: boolean;
@@ -14,6 +14,7 @@ export const FULL_EFFECTS: EffectOptions = { opacity: true, blend: true, filter:
 export class SvgEmitter {
   private defs: string[] = [];
   private gradientIds = new Map<LinearGradientPaint, string>();
+  private patternIds = new Map<string, string>();
   private clipIds = new Map<string, string>();
   private filterIds = new Map<string, string>();
   private seq = 0;
@@ -21,6 +22,9 @@ export class SvgEmitter {
   constructor(
     private scene: Scene,
     private effects: EffectOptions = FULL_EFFECTS,
+    /** resvg 怪癖补偿：userSpaceOnUse 图案的 x/y 只作平铺偏移、内容总被裁到 [0,w]×[0,h]，
+     *  给 resvg 的文档需要把内容包一层 translate(-x,-y)（浏览器等正确渲染器不能加）。 */
+    private resvgQuirk = false,
   ) {}
 
   takeDefs(): string {
@@ -35,15 +39,56 @@ export class SvgEmitter {
     const stops = paint.stops
       .map((s) => `<stop offset="${s.offset}" stop-color="${hex(s.color)}" stop-opacity="${round4(s.color.a)}"/>`)
       .join('');
+    const transform = isIdentity(paint.gradientTransform)
+      ? ''
+      : ` gradientTransform="matrix(${formatMatrix(paint.gradientTransform)})"`;
     this.defs.push(
-      `<linearGradient id="${id}" gradientUnits="${paint.gradientUnits}" x1="${paint.x1}" y1="${paint.y1}" x2="${paint.x2}" y2="${paint.y2}" gradientTransform="${formatMatrix(paint.gradientTransform)}">${stops}</linearGradient>`,
+      `<linearGradient id="${id}" gradientUnits="${paint.gradientUnits}" x1="${paint.x1}" y1="${paint.y1}" x2="${paint.x2}" y2="${paint.y2}"${transform}>${stops}</linearGradient>`,
     );
     return id;
   }
 
-  paintValue(paint: Paint | null): string {
+  private patternMarkup(patternId: string, override?: { dx: number; dy: number } | null): string {
+    const key = override ? `${patternId}|ovr:${override.dx},${override.dy}` : patternId;
+    const existing = this.patternIds.get(key);
+    if (existing) return existing;
+    const def = this.scene.patterns.get(patternId);
+    if (!def) return '';
+    const id = `pat-${++this.seq}`;
+    this.patternIds.set(key, id);
+    const transform = isIdentity(def.patternTransform)
+      ? ''
+      : ` patternTransform="matrix(${formatMatrix(def.patternTransform)})"`;
+    const contentUnits = def.contentUnits === 'objectBoundingBox' ? ' patternContentUnits="objectBoundingBox"' : '';
+    const shapes = def.shapes
+      .map((s) => {
+        const fill = this.paintValue(s.fill);
+        const opacity = s.opacity < 0.999 ? ` opacity="${round4(s.opacity)}"` : '';
+        const fillOpacity =
+          s.fill?.type === 'solid' && s.fill.color.a < 0.999 ? ` fill-opacity="${round4(s.fill.color.a)}"` : '';
+        return `<path d="${escapeAttr(s.d)}" fill="${fill}" fill-rule="${s.fillRule}"${fillOpacity}${opacity}/>`;
+      })
+      .join('');
+    // 「仅实例」原点覆盖 = 平移重复单元格点 → 平移内容（x/y 只决定裁剪窗口，不动格点）
+    let content = shapes;
+    if (override) content = `<g transform="translate(${round4(override.dx)} ${round4(override.dy)})">${content}</g>`;
+    if (this.resvgQuirk && def.patternUnits === 'userSpaceOnUse' && (def.x !== 0 || def.y !== 0)) {
+      content = `<g transform="translate(${round4(-def.x)} ${round4(-def.y)})">${content}</g>`;
+    }
+    this.defs.push(
+      `<pattern id="${id}" patternUnits="${def.patternUnits}"${contentUnits} x="${def.x}" y="${def.y}" width="${def.width}" height="${def.height}"${transform}>${content}</pattern>`,
+    );
+    return id;
+  }
+
+  paintValue(paint: Paint | null, override?: { dx: number; dy: number } | null): string {
     if (!paint) return 'none';
-    if (paint.type === 'solid') return toCss(paint.color);
+    // 纯色只写不透明色值：透明度由 fill-opacity 单独携带（rgba()+fill-opacity 会双重作用）
+    if (paint.type === 'solid') return toHex(paint.color);
+    if (paint.type === 'pattern') {
+      const id = this.patternMarkup(paint.id, override);
+      return id ? `url(#${id})` : 'none';
+    }
     return `url(#${this.gradientMarkup(paint)})`;
   }
 
@@ -113,11 +158,11 @@ export class SvgEmitter {
   }
 
   private pathPaintAttrs(node: Extract<SceneNode, { kind: 'path' }>): string {
-    const attrs = [`fill="${this.paintValue(node.fill)}"`, `fill-rule="${node.fillRule}"`];
+    const attrs = [`fill="${this.paintValue(node.fill, node.patternOriginOverride)}"`, `fill-rule="${node.fillRule}"`];
     if (node.fill && node.fill.type === 'solid') attrs.push(`fill-opacity="${round4(node.fill.color.a)}"`);
     if (node.stroke) {
       attrs.push(
-        `stroke="${toCss(node.stroke)}"`,
+        `stroke="${toHex(node.stroke)}"`,
         `stroke-width="${node.strokeWidth}"`,
         `stroke-linecap="${node.lineCap}"`,
         `stroke-linejoin="${node.lineJoin}"`,
@@ -217,6 +262,7 @@ export function buildIsolatedSvg(
   const emitter = new SvgEmitter(
     scene,
     options.effects === false ? { opacity: true, blend: false, filter: false, clip: false } : FULL_EFFECTS,
+    true,
   );
 
   const inner = emitter.emitTree(node);
@@ -264,7 +310,7 @@ export function buildBackdropSvg(
     if (hidden) continue;
     roots.push(node);
   }
-  const emitter = new SvgEmitter(scene, FULL_EFFECTS);
+  const emitter = new SvgEmitter(scene, FULL_EFFECTS, true);
   const inner = roots.map((n) => emitter.emitTree(n)).join('');
   // 不额外套区域裁剪：resvg 在「透明层 + 全页矩形」同处一个裁剪组时会崩溃；
   // 瓦片本身通过 viewBox 裁剪，输出范围已经严格受限。
@@ -311,6 +357,10 @@ function addWithAncestors(scene: Scene, id: string, into: Set<string>): void {
 function hex(c: { r: number; g: number; b: number }): string {
   const h = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
   return `#${h(c.r)}${h(c.g)}${h(c.b)}`;
+}
+
+function isIdentity(m: readonly number[]): boolean {
+  return m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0;
 }
 
 function round4(v: number): number {

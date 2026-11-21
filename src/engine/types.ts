@@ -22,6 +22,8 @@ export type Feature =
   | 'group-opacity'
   | 'linear-gradient'
   | 'gradient-alpha'
+  | 'pattern'
+  | 'use-instance'
   | 'blur'
   | 'filter-other'
   | 'blend-multiply'
@@ -46,7 +48,34 @@ export interface LinearGradientPaint {
   stops: GradientStop[];
 }
 
-export type Paint = { type: 'solid'; color: Rgba } | LinearGradientPaint;
+export interface PatternPaint {
+  type: 'pattern';
+  /** PatternDef 的 id，定义见 scene.patterns。 */
+  id: string;
+}
+
+export type Paint = { type: 'solid'; color: Rgba } | LinearGradientPaint | PatternPaint;
+
+/** 图案单元内的一条形状（坐标位于图案内容空间）。 */
+export interface PatternShape {
+  d: string;
+  fill: Paint | null;
+  fillRule: 'nonzero' | 'evenodd';
+  opacity: number;
+}
+
+export interface PatternDef {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  patternUnits: 'objectBoundingBox' | 'userSpaceOnUse';
+  contentUnits: 'objectBoundingBox' | 'userSpaceOnUse';
+  patternTransform: Matrix;
+  shapes: PatternShape[];
+}
 
 export interface ClipRef {
   id: string;
@@ -100,6 +129,10 @@ export interface ScenePath extends NodeBase {
   dash: number[];
   filter: FilterInfo | null;
   mask: boolean;
+  /** <use> 实例：被引用定义的 id；几何按 def 局部坐标保存，可写入共享 Form XObject。 */
+  resourceId: string | null;
+  /** 仅覆盖本实例的图案原点偏移（编辑器覆盖层，不改动公共定义）。 */
+  patternOriginOverride: { dx: number; dy: number } | null;
 }
 
 export interface SceneGroup extends NodeBase {
@@ -129,6 +162,7 @@ export interface Scene {
   nodes: SceneNode[];
   byId: Map<string, SceneNode>;
   gradients: Map<string, LinearGradientPaint>;
+  patterns: Map<string, PatternDef>;
   sourceSvg: string;
   warnings: string[];
   /** 文档绘制顺序（只含真正产生绘制的节点）。 */
@@ -194,18 +228,92 @@ export interface ConversionPlan {
 export interface ConversionState {
   builder: import('./pdfBuilder.js').PdfBuilder;
   scene: Scene;
+  /** 页面级 y 翻转矩阵：设计坐标 → PDF 页面默认坐标系。 */
+  pageFlip: import('./matrix.js').Matrix;
   /** 已解码的位图源对象，按对象 id 索引。 */
   sourceImages: Map<string, import('./raster.js').RasterImage>;
   content: string[];
   gStates: Map<string, unknown>;
   gStateRefs: Map<string, { id: number }>;
-  shadings: Map<string, unknown>;
-  shadingRefs: Map<string, { name: string; ref: { id: number } }>;
+  /** 共享 Shading 对象（色标 + 定义空间向量），key 为渐变内容指纹。 */
+  shadingDefs: Map<string, { name: string; ref: { id: number } }>;
+  /** 每使用点的 shading-pattern 包装（Matrix 因实例而异），key 为 shading+矩阵指纹。 */
+  shadingPatterns: Map<string, { name: string; ref: { id: number } }>;
+  /** 平铺图案字典（可含单实例原点覆盖），key 为图案 id+覆盖+单位映射指纹。 */
+  tilingPatterns: Map<string, { name: string; ref: { id: number } }>;
+  /** 图案单元内容 Form XObject，key 为图案 id+内容矩阵指纹。 */
+  cellForms: Map<string, { name: string; ref: { id: number } }>;
+  /** <use> 共享路径几何 Form XObject，key 为 def id+绘制签名。 */
+  pathForms: Map<string, { name: string; ref: { id: number } }>;
+  /** 页级 /Pattern 资源条目。 */
+  patternRefs: Map<string, { name: string; ref: { id: number } }>;
   images: { name: string; ref: { id: number } }[];
   usedImageNames: Set<string>;
   formXObjects: Map<string, unknown>;
   planDecision?: Map<string, Decision>;
   planTiles?: Map<string, TileRaster>;
+  /** 资源表收集器：写入 PDF 时同步记录，供 mapJson 与界面展示。 */
+  resourceLog: ResourceLog;
+}
+
+/** 资源表收集器：记录每个共享对象与每个使用点的引用关系。 */
+export interface ResourceLog {
+  shadings: ShadingResourceInfo[];
+  shadingPatterns: ShadingPatternInfo[];
+  tilingPatterns: TilingPatternInfo[];
+  forms: FormResourceInfo[];
+  usage: ResourceUsage[];
+}
+
+export interface ShadingResourceInfo {
+  name: string;
+  objectId: number;
+  gradientId: string | null;
+  coords: [number, number, number, number];
+  stops: { offset: number; color: string }[];
+}
+
+export interface ShadingPatternInfo {
+  name: string;
+  objectId: number;
+  shading: string;
+  matrix: number[];
+  usedBy: string[];
+}
+
+export interface TilingPatternInfo {
+  name: string;
+  objectId: number;
+  patternId: string;
+  matrix: number[];
+  step: [number, number];
+  bbox: [number, number, number, number];
+  cellForm: string;
+  override: { dx: number; dy: number } | null;
+  usedBy: string[];
+}
+
+export interface FormResourceInfo {
+  name: string;
+  objectId: number;
+  kind: 'shared-path' | 'pattern-cell';
+  sourceId: string;
+  bbox: [number, number, number, number];
+  usedBy: string[];
+}
+
+export interface ResourceUsage {
+  object: string;
+  fillKind: 'solid' | 'gradient' | 'pattern' | 'none';
+  /** 使用点引用的资源名（shading-pattern 或 tiling pattern）。 */
+  resource?: string;
+  /** 共享路径 Form（<use> 实例）。 */
+  pathForm?: string;
+  /** 图案填充：重复单元在该实例局部空间的原点与周期。 */
+  tileOriginLocal?: [number, number];
+  tileOriginDesign?: [number, number];
+  periodLocal?: [number, number];
+  periodDesign?: [number, number];
 }
 
 export interface TileRaster {

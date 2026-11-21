@@ -1,16 +1,22 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createCanvas } from '@napi-rs/canvas';
+import { DOMParser } from 'linkedom';
 import type { Plugin } from 'vite';
 import { parseSvg } from '../src/engine/parseSvg.js';
 import { buildPlan } from '../src/engine/plan.js';
-import { buildPdf } from '../src/engine/pdfWriter.js';
+import { buildPdf, TRANSFORM_SPLIT_NOTES } from '../src/engine/pdfWriter.js';
 import { rasterizeTile } from '../src/engine/rasterizeTile.js';
 import { scaleOf } from '../src/engine/matrix.js';
 import { decodeHref, type RasterImage } from '../src/engine/raster.js';
+import { materializeOverrides, resvgPatternQuirkFix } from '../src/lib/svgEdits.js';
 import type { ClipRef, ConversionPlan, Decision, Scene, SceneNode, TileRaster } from '../src/engine/types.js';
 
-const POSTER_PATH = path.resolve(process.cwd(), 'src/artwork/poster.svg');
+const ARTWORKS: Record<string, string> = {
+  poster: 'src/artwork/poster.svg',
+  duo: 'src/artwork/duo.svg',
+};
+const DEFAULT_ART = 'poster';
 
 interface Box {
   x: number;
@@ -19,11 +25,25 @@ interface Box {
   h: number;
 }
 
+interface PatternOverride {
+  dx: number;
+  dy: number;
+}
+
 interface ConvertBody {
   profileId?: string;
   strict?: boolean;
   rasterScale?: number;
   svg?: string;
+  art?: string;
+  patternOverrides?: Record<string, PatternOverride>;
+}
+
+interface SourcePngBody {
+  svg?: string;
+  art?: string;
+  width?: number;
+  patternOverrides?: Record<string, PatternOverride>;
 }
 
 interface ReadbackGeometry {
@@ -63,6 +83,7 @@ interface ReadbackObject {
 interface ConvertResult {
   ok: boolean;
   status: number;
+  art: string;
   profileId: string;
   profileName: string;
   strict: boolean;
@@ -100,6 +121,14 @@ interface ConvertResult {
   objects: ReadbackObject[];
   page: { width: number; height: number };
   warnings: string[];
+  resources?: {
+    transformSplit: string[];
+    shadings: unknown[];
+    shadingPatterns: unknown[];
+    tilingPatterns: unknown[];
+    forms: unknown[];
+    usage: unknown[];
+  };
   pdfBase64?: string;
   mapJson?: string;
 }
@@ -108,9 +137,10 @@ export function inkplateServerPlugin(): Plugin {
   return {
     name: 'inkplate-convert-server',
     configureServer(server) {
-      server.middlewares.use('/api/poster', (_req, res) => {
+      server.middlewares.use('/api/poster', (req, res) => {
+        const art = normalizeArt(new URL(req.url ?? '/', 'http://x').searchParams.get('art'));
         res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
-        res.end(readPosterSvg());
+        res.end(readArtworkSvg(art));
       });
       server.middlewares.use('/api/convert', async (req, res) => {
         if (req.method !== 'POST') {
@@ -132,9 +162,26 @@ export function inkplateServerPlugin(): Plugin {
       });
       server.middlewares.use('/api/source.png', async (req, res) => {
         try {
-          const width = clamp(Number(new URL(req.url ?? '/', 'http://x').searchParams.get('width') ?? 880), 220, 1760);
+          let svg: string;
+          let width: number;
+          let overrides: Record<string, PatternOverride> | undefined;
+          if (req.method === 'POST') {
+            const body = JSON.parse(await readBody(req)) as SourcePngBody;
+            svg = body.svg?.trim() ? body.svg : readArtworkSvg(normalizeArt(body.art ?? null));
+            width = clamp(Number(body.width ?? 880), 220, 1760);
+            overrides = sanitizeOverrides(body.patternOverrides);
+          } else {
+            const url = new URL(req.url ?? '/', 'http://x');
+            svg = readArtworkSvg(normalizeArt(url.searchParams.get('art')));
+            width = clamp(Number(url.searchParams.get('width') ?? 880), 220, 1760);
+          }
+          if (overrides && Object.keys(overrides).length) {
+            svg = applyOverridesToSvg(svg, overrides);
+          } else {
+            svg = applyResvgQuirkFix(svg);
+          }
           const { Resvg } = await import('@resvg/resvg-js');
-          const r = new Resvg(readPosterSvg(), { fitTo: { mode: 'width', value: width } });
+          const r = new Resvg(svg, { fitTo: { mode: 'width', value: width } });
           res.setHeader('Content-Type', 'image/png');
           res.end(Buffer.from(r.render().asPng()));
         } catch (err) {
@@ -146,8 +193,42 @@ export function inkplateServerPlugin(): Plugin {
   };
 }
 
-function readPosterSvg(): string {
-  return readFileSync(POSTER_PATH, 'utf8');
+function normalizeArt(art: string | null | undefined): string {
+  return art && art in ARTWORKS ? art : DEFAULT_ART;
+}
+
+function readArtworkSvg(art: string): string {
+  return readFileSync(path.resolve(process.cwd(), ARTWORKS[art] ?? ARTWORKS[DEFAULT_ART]), 'utf8');
+}
+
+/** 把「仅实例」的图案原点覆盖物化进 SVG 文本，并套用 resvg 图案怪癖补丁，供独立渲染器复现引擎效果。 */
+function applyOverridesToSvg(svg: string, overrides: Record<string, PatternOverride>): string {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  materializeOverrides(doc as never, overrides);
+  resvgPatternQuirkFix(doc as never);
+  return doc.toString();
+}
+
+/** resvg 把 userSpaceOnUse 图案内容总裁到 [0,w]×[0,h]（忽略 x/y），负原点画板需要内容平移补丁。 */
+function applyResvgQuirkFix(svg: string): string {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  resvgPatternQuirkFix(doc as never);
+  return doc.toString();
+}
+
+function sanitizeOverrides(
+  raw: Record<string, PatternOverride> | undefined,
+): Record<string, PatternOverride> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Record<string, PatternOverride> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!v || typeof v !== 'object') continue;
+    const dx = Number((v as PatternOverride).dx);
+    const dy = Number((v as PatternOverride).dy);
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) continue;
+    out[k] = { dx, dy };
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 function readBody(req: import('node:http').IncomingMessage): Promise<string> {
@@ -160,8 +241,10 @@ function readBody(req: import('node:http').IncomingMessage): Promise<string> {
 }
 
 async function convert(body: ConvertBody): Promise<ConvertResult> {
-  const svg = body.svg?.trim() ? body.svg : readPosterSvg();
-  const scene = parseSvg(svg);
+  const art = normalizeArt(body.art ?? null);
+  const svg = body.svg?.trim() ? body.svg : readArtworkSvg(art);
+  const patternOverrides = sanitizeOverrides(body.patternOverrides);
+  const scene = parseSvg(svg, patternOverrides ? { patternOverrides } : undefined);
   const profileId = body.profileId ?? 'pdf17-native';
   const strict = !!body.strict;
   const rasterScale = clamp(body.rasterScale ?? 2, 1, 4);
@@ -176,6 +259,7 @@ async function convert(body: ConvertBody): Promise<ConvertResult> {
   const base: ConvertResult = {
     ok: plan.status === 'ok',
     status: plan.status === 'ok' ? 200 : 422,
+    art,
     profileId: plan.profileId,
     profileName: plan.profileName,
     strict: plan.strict,
@@ -215,6 +299,7 @@ async function convert(body: ConvertBody): Promise<ConvertResult> {
   const pdf = buildPdf({ scene, plan, tiles, images });
   return {
     ...base,
+    resources: { transformSplit: TRANSFORM_SPLIT_NOTES, ...pdf.resources },
     pdfBase64: Buffer.from(pdf.bytes).toString('base64'),
     mapJson: pdf.mapJson,
   };

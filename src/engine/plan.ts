@@ -27,6 +27,7 @@ const RASTER_FEATURES: Feature[] = [
   'mask',
   'gradient-alpha',
   'linear-gradient',
+  'pattern',
 ];
 
 const EFFECT_ORDER: Feature[] = [
@@ -37,6 +38,7 @@ const EFFECT_ORDER: Feature[] = [
   'mask',
   'gradient-alpha',
   'linear-gradient',
+  'pattern',
 ];
 
 export function buildPlan(scene: Scene, options: PlanOptions): ConversionPlan {
@@ -189,7 +191,9 @@ export function buildPlan(scene: Scene, options: PlanOptions): ConversionPlan {
             : '组按嵌套裁剪/普通容器写入，子对象保持矢量'
           : decision === 'vector-image'
             ? '位图图像以 PDF 图像 XObject 写入'
-            : '按当前变换写入 PDF 矢量路径',
+            : node.kind === 'path' && node.resourceId
+              ? `实例引用 #${node.resourceId}：几何写入共享 Form XObject，实例变换留在使用点 cm`
+              : '按当前变换写入 PDF 矢量路径',
       bounds: clipOf(node) ?? node.worldBounds,
       depth: node.depth,
     });

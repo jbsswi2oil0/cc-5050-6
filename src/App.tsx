@@ -1,21 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ConvertResult } from './lib/types';
 import { PROFILES } from './lib/types';
+import { applyPatternOrigin, applyUseDrag } from './lib/svgEdits';
 import { SourcePanel } from './components/SourcePanel';
 import { PlanPanel } from './components/PlanPanel';
 import { PdfInspector } from './components/PdfInspector';
 import { PixelProbes } from './components/PixelProbes';
+import { ResourcePanel } from './components/ResourcePanel';
 
-export interface ConvertRequest {
-  profileId: string;
-  strict: boolean;
-  rasterScale: number;
+export const ARTWORK_TABS = [
+  { id: 'poster', name: '反例海报', desc: '细藤、偶奇孔、裁剪、混合与模糊' },
+  { id: 'duo', name: '双实例', desc: '共享路径 · 镜像与半尺寸实例 · 平铺图案' },
+] as const;
+
+export type PatternOverrides = Record<string, { dx: number; dy: number }>;
+
+/** 在浏览器里解析 → 修改 → 序列化画板文本。 */
+function editSvg(svgText: string, edit: (doc: Document) => void): string {
+  const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+  edit(doc);
+  return new XMLSerializer().serializeToString(doc);
 }
 
 export function App() {
   const [profileId, setProfileId] = useState('pdf17-native');
   const [strict, setStrict] = useState(false);
   const [rasterScale, setRasterScale] = useState(2);
+  const [art, setArt] = useState<string>('poster');
+  const [svgText, setSvgText] = useState<string>('');
+  const [patternOverrides, setPatternOverrides] = useState<PatternOverrides>({});
   const [result, setResult] = useState<ConvertResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -23,7 +36,25 @@ export function App() {
   const [clickInfo, setClickInfo] = useState<{ x: number; y: number; ids: string[] } | null>(null);
   const requestSeq = useRef(0);
 
+  // 切换画板：取源 SVG、清空覆盖与结果
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/poster?art=${art}`)
+      .then((r) => r.text())
+      .then((text) => {
+        if (!alive) return;
+        setSvgText(text);
+        setPatternOverrides({});
+        setResult(null);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [art]);
+
   const convert = useCallback(async () => {
+    if (!svgText) return;
     const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
@@ -31,7 +62,14 @@ export function App() {
       const res = await fetch('/api/convert', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileId, strict, rasterScale }),
+        body: JSON.stringify({
+          profileId,
+          strict,
+          rasterScale,
+          svg: svgText,
+          art,
+          patternOverrides: Object.keys(patternOverrides).length ? patternOverrides : undefined,
+        }),
       });
       const data = (await res.json()) as ConvertResult & { error?: string };
       if (seq !== requestSeq.current) return;
@@ -46,7 +84,7 @@ export function App() {
     } finally {
       if (seq === requestSeq.current) setLoading(false);
     }
-  }, [profileId, strict, rasterScale]);
+  }, [profileId, strict, rasterScale, svgText, art, patternOverrides]);
 
   useEffect(() => {
     void convert();
@@ -59,10 +97,30 @@ export function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `inkplate-${result.profileId}${result.strict ? '-strict' : ''}.pdf`;
+    a.download = `inkplate-${result.art}-${result.profileId}${result.strict ? '-strict' : ''}.pdf`;
     a.click();
     URL.revokeObjectURL(url);
   }, [result]);
+
+  /** 预览里拖动实例：平移量写回源 SVG 的 <use> 变换，随后自动重转。 */
+  const dragInstance = useCallback((id: string, dx: number, dy: number) => {
+    setSvgText((cur) => editSvg(cur, (doc) => applyUseDrag(doc as never, { [id]: { dx, dy } })));
+  }, []);
+
+  /** 图案原点 · 更改公共定义：所有引用实例一起移动。 */
+  const patternOriginShared = useCallback((patternId: string, x: number, y: number) => {
+    setSvgText((cur) => editSvg(cur, (doc) => applyPatternOrigin(doc as never, patternId, x, y)));
+  }, []);
+
+  /** 图案原点 · 仅覆盖某一实例：引擎在使用点的 Pattern /Matrix 里平移。 */
+  const patternOriginInstance = useCallback((nodeId: string, dx: number, dy: number) => {
+    setPatternOverrides((cur) => {
+      const next = { ...cur };
+      if (dx === 0 && dy === 0) delete next[nodeId];
+      else next[nodeId] = { dx, dy };
+      return next;
+    });
+  }, []);
 
   const selected = useMemo(
     () => result?.entries.find((e) => e.objectId === selectedId) ?? null,
@@ -92,6 +150,25 @@ export function App() {
       </header>
 
       <section className="controls">
+        <div className="control-group">
+          <label className="control-label">画板</label>
+          <div className="segmented" role="radiogroup" aria-label="画板">
+            {ARTWORK_TABS.map((t) => (
+              <button
+                key={t.id}
+                role="radio"
+                aria-checked={art === t.id}
+                className={`segment ${art === t.id ? 'active' : ''}`}
+                onClick={() => setArt(t.id)}
+                data-testid={`art-${t.id}`}
+              >
+                {t.name}
+              </button>
+            ))}
+          </div>
+          <p className="control-help">{ARTWORK_TABS.find((t) => t.id === art)?.desc}</p>
+        </div>
+
         <div className="control-group">
           <label className="control-label">目标能力档案</label>
           <div className="segmented" role="radiogroup" aria-label="目标能力档案">
@@ -171,8 +248,10 @@ export function App() {
         <main className="workspace">
           <SourcePanel
             result={result}
+            svg={svgText}
             selectedId={selectedId}
             onSelect={setSelectedId}
+            onDragInstance={dragInstance}
           />
           <PlanPanel
             result={result}
@@ -193,7 +272,18 @@ export function App() {
         </main>
       )}
 
-      {result?.pdfBase64 && <PixelProbes result={result} />}
+      {result?.resources && (
+        <ResourcePanel
+          result={result}
+          overrides={patternOverrides}
+          onSharedOrigin={patternOriginShared}
+          onInstanceOrigin={patternOriginInstance}
+        />
+      )}
+
+      {result?.pdfBase64 && (
+        <PixelProbes result={result} svg={svgText} patternOverrides={patternOverrides} />
+      )}
 
       <footer className="footnote">
         解析 → 场景 IR → 能力计划 → PDF 写入器 全程本地执行；栅格块用 resvg 独立渲染，PDF 回读用 PDF.js。
